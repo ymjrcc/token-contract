@@ -8,6 +8,16 @@
 ;;           royalty_params:^RoyaltyParams
 ;;           = Storage;
 
+;; 存储结构说明
+;; Storage 包含以下字段:
+;; - owner_address: NFT 集合拥有者地址
+;; - next_item_index: 下一个要铸造的 NFT 序号
+;; - collection_content: 集合元数据
+;; - common_content: NFT 通用元数据
+;; - nft_item_code: NFT Item 合约代码
+;; - royalty_params: 版税参数(费率分子,费率分母,接收地址)
+
+;; 加载合约存储数据
 (slice, int, cell, cell, cell) load_data() inline {
   var ds = get_data().begin_parse();
   return 
@@ -19,6 +29,7 @@
      );
 }
 
+;; 保存合约数据
 () save_data(slice owner_address, int next_item_index, cell content, cell nft_item_code, cell royalty_params) impure inline {
   set_data(begin_cell()
     .store_slice(owner_address)
@@ -29,51 +40,71 @@
     .end_cell());
 }
 
+;; 计算 NFT Item 合约的 StateInit
 cell calculate_nft_item_state_init(int item_index, cell nft_item_code) {
+  ;; NFT Item 初始数据:index + collection_address
   cell data = begin_cell().store_uint(item_index, 64).store_slice(my_address()).end_cell();
-  return begin_cell().store_uint(0, 2).store_dict(nft_item_code).store_dict(data).store_uint(0, 1).end_cell();
+  ;; 构建 StateInit
+  return begin_cell()
+    .store_uint(0, 2)        ;; split_depth:0, special:0
+    .store_dict(nft_item_code) ;; code
+    .store_dict(data)        ;; data
+    .store_uint(0, 1)        ;; libraries
+    .end_cell();
 }
 
+;; 计算 NFT Item 合约地址
 slice calculate_nft_item_address(int wc, cell state_init) {
-  return begin_cell().store_uint(4, 3)
-                     .store_int(wc, 8)
-                     .store_uint(cell_hash(state_init), 256)
-                     .end_cell()
-                     .begin_parse();
+  return begin_cell()
+    .store_uint(4, 3)         ;; addr_std$10 + anycast:0 
+    .store_int(wc, 8)         ;; workchain_id
+    .store_uint(cell_hash(state_init), 256) ;; state_init 哈希
+    .end_cell()
+    .begin_parse();
 }
 
+;; 部署单个 NFT Item 合约
 () deploy_nft_item(int item_index, cell nft_item_code, int amount, cell nft_content) impure {
+  ;; 计算合约地址
   cell state_init = calculate_nft_item_state_init(item_index, nft_item_code);
   slice nft_address = calculate_nft_item_address(workchain(), state_init);
+
+  ;; 构建部署消息
   var msg = begin_cell()
-            .store_uint(0x18, 6)
-            .store_slice(nft_address)
-            .store_coins(amount)
-            .store_uint(4 + 2 + 1, 1 + 4 + 4 + 64 + 32 + 1 + 1 + 1)
-            .store_ref(state_init)
-            .store_ref(nft_content);
+    .store_uint(0x18, 6)           ;; 外部消息标识
+    .store_slice(nft_address)      ;; 目标地址
+    .store_coins(amount)           ;; 发送的 TON 数量
+    .store_uint(4 + 2 + 1, 1 + 4 + 4 + 64 + 32 + 1 + 1 + 1) ;; 消息标识
+    .store_ref(state_init)         ;; StateInit
+    .store_ref(nft_content);       ;; NFT 元数据
+
+    ;; 发送消息
   send_raw_message(msg.end_cell(), 1); ;; pay transfer fees separately, revert on errors
 }
 
+;; 发送版税参数
 () send_royalty_params(slice to_address, int query_id, slice data) impure inline {
   var msg = begin_cell()
-    .store_uint(0x10, 6) ;; nobounce - int_msg_info$0 ihr_disabled:Bool bounce:Bool bounced:Bool src:MsgAddress -> 011000
-    .store_slice(to_address)
-    .store_coins(0)
-    .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
-    .store_uint(op::report_royalty_params(), 32)
-    .store_uint(query_id, 64)
-    .store_slice(data);
+    .store_uint(0x10, 6)              ;; 消息标识
+    .store_slice(to_address)          ;; 接收地址
+    .store_coins(0)                   ;; 金额
+    .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1) ;; 消息标识
+    .store_uint(op::report_royalty_params(), 32) ;; 操作码
+    .store_uint(query_id, 64)         ;; 查询ID
+    .store_slice(data);               ;; 版税数据
   send_raw_message(msg.end_cell(), 64); ;; carry all the remaining value of the inbound message
 }
 
+;; 处理接收到的内部消息
 () recv_internal(cell in_msg_full, slice in_msg_body) impure {
+    ;; 忽略空消息
     if (in_msg_body.slice_empty?()) { ;; ignore empty messages
         return ();
     }
     slice cs = in_msg_full.begin_parse();
     int flags = cs~load_uint(4);
     
+    ;; 忽略 bounce 消息
     if (flags & 1) { ;; ignore all bounced messages
         return ();
     }
@@ -84,15 +115,18 @@ slice calculate_nft_item_address(int wc, cell state_init) {
 
     var (owner_address, next_item_index, content, nft_item_code, royalty_params) = load_data();
 
+    ;; 处理查询版税参数请求
     if (op == op::get_royalty_params()) {
         send_royalty_params(sender_address, query_id, royalty_params.begin_parse());
         return ();
     }
 
+    ;; 检查发送者是否为owner
     throw_unless(401, equal_slices(sender_address, owner_address));
     
   
-    if (op == 1) { ;; deploy new nft
+    ;; 处理不同操作
+    if (op == 1) { ;; deploy new nft  ;; 部署单个 NFT
       int item_index = in_msg_body~load_uint(64);
       throw_unless(402, item_index <= next_item_index);
       var is_last = item_index == next_item_index;
@@ -103,13 +137,14 @@ slice calculate_nft_item_address(int wc, cell state_init) {
       }
       return ();
     }
-    if (op == 2) { ;; batch deploy of new nfts
+    if (op == 2) { ;; batch deploy of new nfts  ;; 批量部署 NFT
       int counter = 0;
       cell deploy_list = in_msg_body~load_ref();
       do {
         var (item_index, item, f?) = deploy_list~udict::delete_get_min(64);
         if (f?) {
           counter += 1;
+          ;; 限制每次最多部署250个(due to action list size limits)
           if (counter >= 250) { ;; Limit due to limits of action list size
             throw(399);
           }
@@ -129,29 +164,33 @@ slice calculate_nft_item_address(int wc, cell state_init) {
       save_data(new_owner, next_item_index, content, nft_item_code, royalty_params);
       return ();
     }
-    throw(0xffff);
+    throw(0xffff);  ;; 未知操作码
 }
 
 ;; Get methods
 
+;; 获取集合数据
 (int, cell, slice) get_collection_data() method_id {
   var (owner_address, next_item_index, content, _, _) = load_data();
   slice cs = content.begin_parse();
   return (next_item_index, cs~load_ref(), owner_address);
 }
 
+;; 通过索引获取 NFT 地址
 slice get_nft_address_by_index(int index) method_id {
     var (_, _, _, nft_item_code, _) = load_data();
     cell state_init = calculate_nft_item_state_init(index, nft_item_code);
     return calculate_nft_item_address(workchain(), state_init);
 }
 
+;; 获取版税参数
 (int, int, slice) royalty_params() method_id {
      var (_, _, _, _, royalty) = load_data();
      slice rs = royalty.begin_parse();
      return (rs~load_uint(16), rs~load_uint(16), rs~load_msg_addr());
 }
 
+;; 获取 NFT 内容
 cell get_nft_content(int index, cell individual_nft_content) method_id {
   var (_, _, content, _, _) = load_data();
   slice cs = content.begin_parse();
